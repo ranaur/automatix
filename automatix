@@ -1,0 +1,351 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  automatix new [--job NAME] [--move] main_script [additional_files ...]
+  automatix update
+  automatix process job_name
+  automatix cleanup
+USAGE
+}
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+now_ts() {
+  date +%Y%m%d-%H%M%S
+}
+
+expand_now_token() {
+  local s="${1:-}"
+  local ts
+  ts="$(now_ts)"
+  printf '%s' "${s//_NOW_/$ts}"
+}
+
+git_root() {
+  git rev-parse --show-toplevel 2>/dev/null
+}
+
+ensure_repo() {
+  require_cmd git
+  local root
+  root="$(git_root || true)"
+  [[ -n "$root" ]] || die "not inside a git repository"
+}
+
+repo_cd_root() {
+  cd "$(git_root)"
+}
+
+ensure_dirs() {
+  mkdir -p inbox work finished bin
+}
+
+git_pull_rebase() {
+  git pull --rebase
+}
+
+git_commit_push_if_needed() {
+  local msg="$1"
+  git add -A
+  if git diff --cached --quiet; then
+    return 0
+  fi
+  git commit -m "$msg"
+  git push
+}
+
+job_has_wait_clause() {
+  local job_dir="$1"
+  local wait_val="true"
+
+  if [[ -f "$job_dir/.jobrc" ]]; then
+    ( set -a; source "$job_dir/.jobrc"; set +a; printf '%s' "${AUTOMATIX_WAIT:-true}" )
+    return 0
+  fi
+
+  printf '%s' "$wait_val"
+}
+
+job_is_running() {
+  local job_dir="$1"
+  [[ -f "$job_dir/automatix.log" ]] || return 1
+  local state
+  state="$(grep -E '^STATE=' "$job_dir/automatix.log" | tail -n 1 | cut -d= -f2- || true)"
+  [[ "$state" == "running" ]]
+}
+
+cleanup_cmd() {
+  ensure_repo
+  repo_cd_root
+  ensure_dirs
+
+  git_pull_rebase
+
+  shopt -s nullglob
+  local job_dir job pid state
+  for job_dir in work/*; do
+    [[ -d "$job_dir" ]] || continue
+    job="$(basename "$job_dir")"
+
+    if [[ ! -f "$job_dir/automatix.log" ]]; then
+      continue
+    fi
+
+    state="$(grep -E '^STATE=' "$job_dir/automatix.log" | tail -n 1 | cut -d= -f2- || true)"
+
+    if [[ "$state" == "running" ]]; then
+      pid="$(grep -E '^PID=' "$job_dir/automatix.log" | tail -n 1 | cut -d= -f2- || true)"
+      if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        (
+          cd "$job_dir"
+          git_commit_push_if_needed "update $job"
+        )
+        continue
+      fi
+
+      (
+        cd "$job_dir"
+        echo "STATE=aborted" >> automatix.log
+        echo "ABORTED_AT=$(date -Is)" >> automatix.log
+        git_commit_push_if_needed "aborted $job"
+      )
+      state="aborted"
+    fi
+
+    if [[ "$state" == "finished" || "$state" == "aborted" ]]; then
+      git mv "work/$job" "finished/$job"
+      git_commit_push_if_needed "archived $job"
+    fi
+  done
+}
+
+process_cmd() {
+  local job="$1"
+  [[ -n "$job" ]] || die "missing job_name"
+
+  ensure_repo
+  repo_cd_root
+  ensure_dirs
+
+  git_pull_rebase
+
+  [[ -d "inbox/$job" ]] || die "job not found: inbox/$job"
+
+  git mv "inbox/$job" "work/$job"
+  git_commit_push_if_needed "start $job"
+
+  cd "work/$job"
+
+  local AUTOMATIX_COMMAND AUTOMATIX_MAIN_SCRIPT AUTOMATIX_WAIT AUTOMATIX_DELAY
+  AUTOMATIX_COMMAND="bash -c"
+  AUTOMATIX_MAIN_SCRIPT=""
+  AUTOMATIX_WAIT="true"
+  AUTOMATIX_DELAY="30"
+
+  if [[ -f .jobrc ]]; then
+    source .jobrc
+  fi
+
+  [[ -n "${AUTOMATIX_MAIN_SCRIPT:-}" ]] || die "AUTOMATIX_MAIN_SCRIPT is empty"
+  [[ -f "${AUTOMATIX_MAIN_SCRIPT}" ]] || die "main script not found: ${AUTOMATIX_MAIN_SCRIPT}"
+
+  : > automatix.out
+
+  {
+    echo "JOB=$job"
+    echo "START_AT=$(date -Is)"
+    echo "STATE=running"
+  } > automatix.log
+
+  (
+    set +e
+    IFS=' ' read -r -a _automatix_cmd_argv <<<"$AUTOMATIX_COMMAND"
+    if [[ ${#_automatix_cmd_argv[@]} -eq 0 ]]; then
+      die "AUTOMATIX_COMMAND is empty"
+    fi
+    "${_automatix_cmd_argv[@]}" "./$AUTOMATIX_MAIN_SCRIPT"
+    echo "$?" > .automatix.exit_code
+  ) > automatix.out 2>&1 &
+
+  local pid=$!
+  echo "PID=$pid" >> automatix.log
+
+  sleep "${AUTOMATIX_DELAY}"
+
+  git_commit_push_if_needed "running $job"
+
+  wait "$pid" || true
+
+  local exit_code="0"
+  if [[ -f .automatix.exit_code ]]; then
+    exit_code="$(cat .automatix.exit_code || echo 0)"
+  fi
+
+  {
+    echo "FINISH_AT=$(date -Is)"
+    echo "EXIT_CODE=$exit_code"
+    echo "STATE=finished"
+  } >> automatix.log
+
+  rm -f .automatix.exit_code
+
+  git_commit_push_if_needed "finished $job"
+}
+
+update_cmd() {
+  ensure_repo
+  repo_cd_root
+  ensure_dirs
+
+  git_pull_rebase
+
+  cleanup_cmd
+
+  shopt -s nullglob
+  local w job_dir wait_val
+  for w in work/*; do
+    [[ -d "$w" ]] || continue
+    if job_is_running "$w"; then
+      wait_val="$(job_has_wait_clause "$w" | tr '[:upper:]' '[:lower:]')"
+      if [[ "$wait_val" != "false" && "$wait_val" != "0" && "$wait_val" != "no" ]]; then
+        return 0
+      fi
+    fi
+  done
+
+  local next_job=""
+  for job_dir in inbox/*; do
+    [[ -d "$job_dir" ]] || continue
+    next_job="$(basename "$job_dir")"
+    break
+  done
+
+  [[ -n "$next_job" ]] || return 0
+
+  ("$0" process "$next_job") >/dev/null 2>&1 &
+}
+
+new_cmd() {
+  local job_name=""
+  local move_files="false"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -j|--job)
+        shift
+        [[ $# -gt 0 ]] || die "--job requires a value"
+        job_name="$1"
+        shift
+        ;;
+      -m|--move)
+        move_files="true"
+        shift
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  [[ $# -ge 1 ]] || die "missing main_script"
+
+  ensure_repo
+  repo_cd_root
+  ensure_dirs
+
+  git_pull_rebase
+
+  local ts
+  ts="$(now_ts)"
+
+  if [[ -z "$job_name" ]]; then
+    job_name="$ts"
+  else
+    job_name="$(expand_now_token "$job_name")"
+  fi
+
+  local main_script="$1"
+  shift
+
+  [[ -f "$main_script" ]] || die "file not found: $main_script"
+
+  local job_dir="inbox/$job_name"
+  [[ ! -e "$job_dir" ]] || die "job already exists: $job_dir"
+  mkdir -p "$job_dir"
+
+  local f
+  local copied_main_basename
+  copied_main_basename="$(basename "$main_script")"
+
+  if [[ "$move_files" == "true" ]]; then
+    mv "$main_script" "$job_dir/"
+  else
+    cp "$main_script" "$job_dir/"
+  fi
+
+  for f in "$@"; do
+    [[ -f "$f" ]] || die "file not found: $f"
+    if [[ "$move_files" == "true" ]]; then
+      mv "$f" "$job_dir/"
+    else
+      cp "$f" "$job_dir/"
+    fi
+  done
+
+  cat > "$job_dir/.jobrc" <<EOF
+AUTOMATIX_COMMAND="bash -c"
+AUTOMATIX_MAIN_SCRIPT="$copied_main_basename"
+AUTOMATIX_WAIT="true"
+AUTOMATIX_DELAY="30"
+EOF
+
+  git_commit_push_if_needed "new job $job_name"
+}
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    new)
+      shift
+      new_cmd "$@"
+      ;;
+    update)
+      shift
+      update_cmd
+      ;;
+    process)
+      shift
+      process_cmd "${1:-}"
+      ;;
+    cleanup)
+      shift
+      cleanup_cmd
+      ;;
+    -h|--help|help|"")
+      usage
+      ;;
+    *)
+      die "unknown command: $cmd"
+      ;;
+  esac
+}
+
+main "$@"
