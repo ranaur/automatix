@@ -1,5 +1,5 @@
 #!/bin/sh
 
-echo Hello automatix!
+echo Hello automatix! 2
 
-exit 0
+exit 1

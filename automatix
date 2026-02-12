@@ -84,6 +84,17 @@ job_is_running() {
   [[ "$state" == "running" ]]
 }
 
+update_job_state() {
+  local job_dir="$1"
+  local new_state="$2"
+  [[ -f "$job_dir/automatix.log" ]] || return 1
+  
+  # Remove existing STATE= line and append new one
+  grep -v '^STATE=' "$job_dir/automatix.log" > "$job_dir/automatix.log.tmp" || true
+  echo "STATE=$new_state" >> "$job_dir/automatix.log.tmp"
+  mv "$job_dir/automatix.log.tmp" "$job_dir/automatix.log"
+}
+
 cleanup_cmd() {
   ensure_repo
   repo_cd_root
@@ -115,7 +126,7 @@ cleanup_cmd() {
 
       (
         cd "$job_dir"
-        echo "STATE=aborted" >> automatix.log
+        update_job_state "." "aborted"
         echo "ABORTED_AT=$(date -Is)" >> automatix.log
         git_commit_push_if_needed "aborted $job"
       )
@@ -194,8 +205,9 @@ process_cmd() {
   {
     echo "FINISH_AT=$(date -Is)"
     echo "EXIT_CODE=$exit_code"
-    echo "STATE=finished"
   } >> automatix.log
+  
+  update_job_state "." "finished"
 
   rm -f .automatix.exit_code
 
