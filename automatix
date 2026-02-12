@@ -50,8 +50,8 @@ ensure_dirs() {
   mkdir -p inbox work finished bin
 }
 
-git_pull_rebase() {
-  git pull --rebase
+git_pull() {
+  git pull
 }
 
 git_commit_push_if_needed() {
@@ -100,7 +100,7 @@ cleanup_cmd() {
   repo_cd_root
   ensure_dirs
 
-  git_pull_rebase
+  git_pull
 
   shopt -s nullglob
   local job_dir job pid state
@@ -148,7 +148,7 @@ process_cmd() {
   repo_cd_root
   ensure_dirs
 
-  git_pull_rebase
+  git_pull
 
   [[ -d "inbox/$job" ]] || die "job not found: inbox/$job"
 
@@ -219,7 +219,7 @@ update_cmd() {
   repo_cd_root
   ensure_dirs
 
-  git_pull_rebase
+  git_pull
 
   cleanup_cmd
 
@@ -283,7 +283,7 @@ new_cmd() {
   repo_cd_root
   ensure_dirs
 
-  git_pull_rebase
+  git_pull
 
   local ts
   ts="$(now_ts)"
