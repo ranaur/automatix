@@ -47,9 +47,9 @@ automatix process job_name
     The script does:
     1) git mv the job directory (in inbox/job_name) to working directory
     2) cd to the directory
-    4) source the .jobrc if exists
-    5) initializes automatix.log with the start date of the job, and mark it's state as running.
-    6) starts the $AUTOMATIX_COMMAND $AUTOMATIX_MAIN_SCRIPT redirecting all the output to automatix.out in background
+    3) source the .jobrc if exists
+    4) initializes automatix.log with the start date of the job, and mark it's state as running.
+    5) starts the $AUTOMATIX_COMMAND $AUTOMATIX_MAIN_SCRIPT redirecting all the output to automatix.out in background
     6) record the PID of the process in automatix.log
     7) waits AUTOMATIX_DELAY seconds
     8) add all files, commits and pushes
